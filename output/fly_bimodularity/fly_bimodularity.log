@@ -1,0 +1,41 @@
+2025-12-02 16:27:12,322 [INFO] Loading connections from ../data/raw/connections_princeton.csv
+2025-12-02 16:27:18,157 [INFO] Building adjacency with top_n_nodes=5000
+2025-12-02 16:27:43,748 [INFO] Nodes kept: 5000 | edges kept: 488031 | total synapses: 6873682
+2025-12-02 16:27:43,749 [INFO] Top 10 nodes by strength:
+720575940626979621    185213.0
+720575940628908548    182325.0
+720575940624547622    173522.0
+720575940613583001    157159.0
+720575940634612194     99466.0
+720575940627497244     85512.0
+720575940625952755     84963.0
+720575940619991862     82477.0
+720575940620975696     78516.0
+720575940620008758     71512.0
+Name: syn_count, dtype: float64
+2025-12-02 16:27:43,752 [INFO] Computing directed modularity and SVD
+2025-12-02 16:28:58,803 [INFO] Clustering edges: n_clusters=6, n_vectors=4
+2025-12-02 16:31:27,909 [INFO] Loading connections from ../data/raw/connections_princeton.csv
+2025-12-02 16:31:32,751 [INFO] Building adjacency with top_n_nodes=1000
+2025-12-02 16:31:37,433 [INFO] Nodes kept: 1000 | edges kept: 63774 | total synapses: 1341425
+2025-12-02 16:31:37,433 [INFO] Top 10 nodes by strength:
+720575940626979621    185213.0
+720575940628908548    182325.0
+720575940624547622    173522.0
+720575940613583001    157159.0
+720575940634612194     99466.0
+720575940627497244     85512.0
+720575940625952755     84963.0
+720575940619991862     82477.0
+720575940620975696     78516.0
+720575940620008758     71512.0
+Name: syn_count, dtype: float64
+2025-12-02 16:31:37,445 [INFO] Computing directed modularity and SVD
+2025-12-02 16:31:40,202 [INFO] Clustering edges: n_clusters=6, n_vectors=4
+2025-12-02 16:31:45,693 [INFO] Edge cluster sizes: [980075   4979   1994   1982   1994   1982]
+2025-12-02 16:31:45,693 [INFO] Sending communities: [991   5   2   0   2]
+2025-12-02 16:31:45,694 [INFO] Receiving communities: [996   0   0   2   0   2]
+2025-12-02 16:31:45,694 [INFO] Computing bimodularity scores
+2025-12-02 16:31:53,046 [INFO] Saved bimodularity scores to ../output/fly_bimodularity/bimodularity_scores.csv
+2025-12-02 16:31:53,046 [INFO] Saving figures
+2025-12-02 16:32:35,609 [INFO] Done. Outputs in ../output/fly_bimodularity
