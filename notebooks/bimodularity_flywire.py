@@ -41,6 +41,7 @@ from networkx.algorithms.community.quality import modularity
 class SliceInfo(NamedTuple):
     nodes: list[int]
     reason: str
+    meta: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,8 @@ class BimodularityResult:
     send_label: np.ndarray  # shape (n,)
     recv_label: np.ndarray  # shape (n,)
     edge_cluster: np.ndarray  # shape (m_edges,)
+    edges: list[tuple[int, int]]
+    edge_weight: np.ndarray  # shape (m_edges,)
     n_clusters: int
     q_bimod: float
 
@@ -246,7 +249,7 @@ def pick_slice_via_louvain(
             f"louvain community (n={int(metrics['n'])}, density={metrics['density']:.4g}, "
             f"conductance_out={metrics['conductance_out']:.3f}, score={best_score:.4g})"
         )
-        return SliceInfo(nodes=sorted(best_nodes), reason=reason)
+        return SliceInfo(nodes=sorted(best_nodes), reason=reason, meta={"strategy": "single_louvain"})
 
     # Fallback: pick the closest-sized Louvain community and trim/expand to target range.
     comms_sorted = sorted((set(int(n) for n in c) for c in communities), key=len, reverse=True)
@@ -271,7 +274,7 @@ def pick_slice_via_louvain(
         ranked = sorted(nodes, key=internal_strength, reverse=True)
         nodes = set(ranked[:target_max])
         reason = f"trimmed louvain community to n={len(nodes)} by internal strength"
-        return SliceInfo(nodes=sorted(nodes), reason=reason)
+        return SliceInfo(nodes=sorted(nodes), reason=reason, meta={"strategy": "single_louvain"})
 
     while len(nodes) < target_min:
         candidate_strength: dict[int, float] = defaultdict(float)
@@ -288,7 +291,309 @@ def pick_slice_via_louvain(
         nodes.add(best)
 
     reason = f"expanded louvain community to n={len(nodes)} by neighbor strength"
-    return SliceInfo(nodes=sorted(nodes), reason=reason)
+    return SliceInfo(nodes=sorted(nodes), reason=reason, meta={"strategy": "single_louvain"})
+
+
+def _louvain_partition_on_sym(graph_full: nx.DiGraph, *, seed: int, weight: str = "weight") -> tuple[list[set[int]], dict[int, int]]:
+    und_full = symmetrize_to_undirected(graph_full, weight=weight)
+    communities = louvain_communities(und_full, weight=weight, seed=seed)
+    node_to_cid: dict[int, int] = {}
+    for cid, comm in enumerate(communities):
+        for n in comm:
+            node_to_cid[int(n)] = int(cid)
+    return list(communities), node_to_cid
+
+
+def _community_flow_matrix(
+    graph_full: nx.DiGraph, node_to_cid: dict[int, int], n_comms: int, *, weight: str = "weight"
+) -> np.ndarray:
+    w = np.zeros((n_comms, n_comms), dtype=float)
+    for u, v, data in graph_full.edges(data=True):
+        cu = node_to_cid.get(int(u))
+        cv = node_to_cid.get(int(v))
+        if cu is None or cv is None:
+            continue
+        w[cu, cv] += float(data.get(weight, 1.0))
+    return w
+
+
+def _cycle_candidates_from_flow(
+    flow: np.ndarray,
+    *,
+    cycle_len: int,
+    top_n: int,
+    min_edge_flow: float,
+) -> list[tuple[float, float, float, tuple[int, ...]]]:
+    from itertools import permutations
+
+    c = flow.shape[0]
+    candidates: list[tuple[float, float, float, tuple[int, ...]]] = []
+    for cyc in permutations(range(c), cycle_len):
+        if cyc[0] != min(cyc):
+            continue
+        min_edge = float("inf")
+        log_mag = 0.0
+        log_asym = 0.0
+        for i in range(cycle_len):
+            a = cyc[i]
+            b = cyc[(i + 1) % cycle_len]
+            f = float(flow[a, b])
+            r = float(flow[b, a])
+            min_edge = min(min_edge, f)
+            log_mag += math.log(f + 1.0)
+            log_asym += math.log((f + 1.0) / (r + 1.0))
+        if min_edge < min_edge_flow:
+            continue
+        # prefer (i) asymmetric directed cycles and (ii) sufficient flow magnitude
+        score = log_asym + 0.07 * log_mag + 0.001 * min_edge
+        candidates.append((score, log_asym, min_edge, tuple(int(x) for x in cyc)))
+    candidates.sort(key=lambda t: t[0], reverse=True)
+    return candidates[:top_n]
+
+
+def _select_nodes_from_cycle(
+    graph_full: nx.DiGraph,
+    communities: list[set[int]],
+    cycle: tuple[int, ...],
+    *,
+    target_n: int,
+    seed: int,
+    weight: str = "weight",
+) -> list[int]:
+    rng = np.random.default_rng(seed)
+    cycle = tuple(int(x) for x in cycle)
+    k = len(cycle)
+    sizes = np.asarray([len(communities[cid]) for cid in cycle], dtype=float)
+    # allocate proportional, but keep a minimum presence per community
+    min_per = max(10, int(target_n * 0.12 / max(1, k)))
+    alloc = np.floor(target_n * sizes / sizes.sum()).astype(int)
+    alloc = np.maximum(alloc, min_per)
+    # fix rounding
+    while alloc.sum() > target_n:
+        i = int(np.argmax(alloc))
+        if alloc[i] > min_per:
+            alloc[i] -= 1
+        else:
+            break
+    while alloc.sum() < target_n:
+        alloc[int(np.argmax(sizes))] += 1
+
+    selected: list[int] = []
+    for idx_in_cycle, cid in enumerate(cycle):
+        prev_cid = cycle[(idx_in_cycle - 1) % k]
+        next_cid = cycle[(idx_in_cycle + 1) % k]
+        comm_nodes = [int(n) for n in communities[cid]]
+        prev_nodes = set(int(n) for n in communities[prev_cid])
+        next_nodes = set(int(n) for n in communities[next_cid])
+
+        scores = []
+        for n in comm_nodes:
+            internal = 0.0
+            out_to_next = 0.0
+            in_from_prev = 0.0
+            for _, v, data in graph_full.out_edges(n, data=True):
+                w = float(data.get(weight, 1.0))
+                if v in next_nodes:
+                    out_to_next += w
+                if v in communities[cid]:
+                    internal += w
+            for u, _, data in graph_full.in_edges(n, data=True):
+                w = float(data.get(weight, 1.0))
+                if u in prev_nodes:
+                    in_from_prev += w
+                if u in communities[cid]:
+                    internal += w
+            # prioritize boundary nodes that participate in the directed cycle,
+            # while keeping some internal cohesion.
+            score = 2.5 * out_to_next + 2.5 * in_from_prev + 0.2 * internal
+            scores.append((score, n))
+
+        scores.sort(reverse=True)
+        take = int(min(alloc[idx_in_cycle], len(scores)))
+        # if many nodes tie at score=0, randomize among the tail to avoid bias
+        top = scores[:take]
+        if len(top) < take:
+            missing = take - len(top)
+            rest = [n for _, n in scores[take:]]
+            rng.shuffle(rest)
+            top += [(0.0, n) for n in rest[:missing]]
+        selected.extend([n for _, n in top[:take]])
+
+    selected = list(dict.fromkeys(selected))  # stable unique
+    if len(selected) > target_n:
+        rng.shuffle(selected)
+        selected = selected[:target_n]
+    return selected
+
+
+def pick_slice_via_directed_cycle_search(
+    graph_full: nx.DiGraph,
+    *,
+    target_min: int = 100,
+    target_max: int = 200,
+    seed: int = 0,
+    weight: str = "weight",
+    cycle_lens: tuple[int, ...] = (3, 4),
+    top_cycles_per_len: int = 25,
+    min_edge_flow: float = 1200.0,
+    eval_target_n: int = 160,
+    eval_k_range: tuple[int, int] = (4, 10),
+    eval_min_nodes_per_cluster: int = 12,
+    eval_edge_weight_frac_threshold: float = 0.06,
+    eval_min_edges_per_cluster: int = 150,
+    gamma: float = 1.0,
+    svd_rank: int = 6,
+    min_edge_weight: float = 1.0,
+    max_edges: int = 12000,
+) -> SliceInfo:
+    """
+    Network-science motivated slice selection:
+    - coarse-grain the 1000-node graph into Louvain modules (on symmetrized graph),
+    - build the directed flow matrix between modules,
+    - search for short directed cycles (3-4 modules) with asymmetric high flow,
+    - sample nodes from those modules emphasizing boundary nodes that realize the cycle,
+    - pick the slice that yields multiple non-trivial bicommunities under bimodularity.
+    """
+    communities, node_to_cid = _louvain_partition_on_sym(graph_full, seed=seed, weight=weight)
+    flow = _community_flow_matrix(graph_full, node_to_cid, len(communities), weight=weight)
+    comm_sizes = [len(c) for c in communities]
+
+    cycle_candidates: list[tuple[float, float, float, tuple[int, ...]]] = []
+    for L in cycle_lens:
+        cycle_candidates.extend(
+            _cycle_candidates_from_flow(flow, cycle_len=L, top_n=top_cycles_per_len, min_edge_flow=min_edge_flow)
+        )
+    if not cycle_candidates:
+        raise RuntimeError("No cycle candidates found; lower min_edge_flow or change seed.")
+    cycle_candidates.sort(key=lambda t: t[0], reverse=True)
+
+    best = None
+    best_meta = None
+
+    # Evaluate top candidates by actually running bimodularity on a 150-170 node sampled slice.
+    for rank, (score, log_asym, min_edge, cyc) in enumerate(cycle_candidates[: max(12, top_cycles_per_len)]):
+        nodes = _select_nodes_from_cycle(graph_full, communities, cyc, target_n=eval_target_n, seed=seed + rank, weight=weight)
+        if not (target_min <= len(nodes) <= target_max):
+            # hard trim/expand to be within bounds
+            nodes = nodes[:target_max]
+        graph_slice = graph_full.subgraph(nodes).copy()
+        node_list = list(graph_slice.nodes())
+        a = adjacency_from_digraph(graph_slice, node_list, weight=weight)
+        if a.sum() <= 0:
+            continue
+
+        # quick bimod scan for K and count how many clusters are non-trivial
+        best_k_res = None
+        best_k_score = -float("inf")
+        for k in range(eval_k_range[0], eval_k_range[1] + 1):
+            try:
+                res = bimodularity_partition_via_edge_kmeans(
+                    a,
+                    svd_rank=svd_rank,
+                    n_clusters=k,
+                    min_edge_weight=min_edge_weight,
+                    max_edges=max_edges,
+                    seed=seed,
+                    gamma=gamma,
+                )
+            except Exception:
+                continue
+            total_w = float(res.edge_weight.sum())
+            if total_w <= 0:
+                continue
+
+            w_by_c = np.bincount(res.edge_cluster, weights=res.edge_weight, minlength=k)
+            m_by_c = np.bincount(res.edge_cluster, minlength=k)
+            frac_by_c = w_by_c / total_w
+
+            nontrivial = 0
+            for c_id in range(k):
+                if frac_by_c[c_id] < eval_edge_weight_frac_threshold:
+                    continue
+                if m_by_c[c_id] < eval_min_edges_per_cluster:
+                    continue
+                senders = set()
+                receivers = set()
+                for (i, j), cc in zip(res.edges, res.edge_cluster, strict=True):
+                    if int(cc) == c_id:
+                        senders.add(int(i))
+                        receivers.add(int(j))
+                if len(senders) >= eval_min_nodes_per_cluster and len(receivers) >= eval_min_nodes_per_cluster:
+                    nontrivial += 1
+
+            # prefer many usable bicommunities; break ties by Q_bi
+            slice_score = 10.0 * nontrivial + res.q_bimod
+            if slice_score > best_k_score:
+                best_k_score = slice_score
+                best_k_res = (k, res, nontrivial)
+
+        if best_k_res is None:
+            continue
+        k, res, nontrivial = best_k_res
+        # selection objective: maximize number of non-trivial bicommunities first, then Q_bi
+        overall = (nontrivial, res.q_bimod, score)
+        if best is None or overall > best:
+            best = overall
+            best_meta = {
+                "strategy": "directed_cycle_search",
+                "cycle": cyc,
+                "cycle_len": len(cyc),
+                "cycle_rank": rank,
+                "cycle_score": float(score),
+                "cycle_log_asym": float(log_asym),
+                "cycle_min_edge_flow": float(min_edge),
+                "community_sizes": {int(cid): int(comm_sizes[cid]) for cid in cyc},
+                "eval_target_n": int(eval_target_n),
+                "picked_k": int(k),
+                "nontrivial_clusters": int(nontrivial),
+                "q_bimod": float(res.q_bimod),
+                "edge_weight_frac_threshold": float(eval_edge_weight_frac_threshold),
+                "min_edges_per_cluster": int(eval_min_edges_per_cluster),
+            }
+            best_nodes = nodes
+
+    if best_meta is None:
+        raise RuntimeError("Failed to find any slice that yields non-trivial bicommunities; try different seed.")
+
+    # Ensure final size in requested bounds (prefer evaluation target size).
+    final_target = int(min(max(eval_target_n, target_min), target_max))
+    nodes = list(best_nodes)
+    if len(nodes) > target_max:
+        nodes = nodes[:target_max]
+    elif len(nodes) < target_min:
+        # expand by adding strongest neighbors until min met
+        cur = set(nodes)
+        while len(cur) < target_min:
+            cand: dict[int, float] = defaultdict(float)
+            for u in list(cur):
+                for _, v, data in graph_full.out_edges(u, data=True):
+                    if v not in cur:
+                        cand[int(v)] += float(data.get(weight, 1.0))
+                for v, _, data in graph_full.in_edges(u, data=True):
+                    if v not in cur:
+                        cand[int(v)] += float(data.get(weight, 1.0))
+            if not cand:
+                break
+            cur.add(max(cand.items(), key=lambda t: t[1])[0])
+        nodes = list(cur)
+    if len(nodes) > final_target:
+        nodes = nodes[:final_target]
+
+    cyc = best_meta["cycle"]
+    flows = []
+    for i in range(len(cyc)):
+        a = int(cyc[i])
+        b = int(cyc[(i + 1) % len(cyc)])
+        flows.append(
+            f"C{a}({comm_sizes[a]})->C{b}({comm_sizes[b]})={flow[a,b]:.0f} (rev {flow[b,a]:.0f})"
+        )
+    reason = (
+        "directed cycle among Louvain modules: "
+        + ", ".join(flows)
+        + f"; picked for multiple bicommunities (nontrivial={best_meta['nontrivial_clusters']}, "
+        + f"K={best_meta['picked_k']}, Q_bi~{best_meta['q_bimod']:.4f})"
+    )
+    return SliceInfo(nodes=sorted(int(n) for n in nodes), reason=reason, meta=best_meta)
 
 
 def edge_features_from_svd(
@@ -302,10 +607,14 @@ def edge_features_from_svd(
     k = min(rank, u.shape[1], v.shape[1], s.shape[0])
     u_k = u[:, :k]
     v_k = v[:, :k]
-    s_k = s[:k]
-    features = np.zeros((len(edges), k), dtype=float)
+    # Use concatenated (sender, receiver) embeddings scaled by sqrt singular values.
+    # This matches the intuition in Cionca et al.: edges connect a left-space node
+    # (sender) to a right-space node (receiver) in the bimodularity SVD embedding.
+    s_k = np.sqrt(np.maximum(s[:k], 0.0))
+    features = np.zeros((len(edges), 2 * k), dtype=float)
     for ei, (i, j) in enumerate(edges):
-        features[ei] = s_k * u_k[i] * v_k[j]
+        features[ei, :k] = s_k * u_k[i]
+        features[ei, k:] = s_k * v_k[j]
     return features
 
 
@@ -342,6 +651,10 @@ def bimodularity_partition_via_edge_kmeans(
     v = vh.T
 
     x = edge_features_from_svd(u, s, v, edges, rank=svd_rank)
+    # Standardize features for more stable clustering across graphs.
+    x = x - x.mean(axis=0, keepdims=True)
+    x_std = x.std(axis=0, keepdims=True)
+    x = x / np.where(x_std > 1e-12, x_std, 1.0)
     labels, _, _ = kmeans(
         x,
         n_clusters,
@@ -352,7 +665,8 @@ def bimodularity_partition_via_edge_kmeans(
 
     out_weight_by_cluster = np.zeros((n, n_clusters), dtype=float)
     in_weight_by_cluster = np.zeros((n, n_clusters), dtype=float)
-    for (i, j), c, w in zip(edges, labels, edge_w, strict=True):
+    edge_w_arr = np.asarray(edge_w, dtype=float)
+    for (i, j), c, w in zip(edges, labels, edge_w_arr, strict=True):
         out_weight_by_cluster[i, c] += w
         in_weight_by_cluster[j, c] += w
 
@@ -364,6 +678,8 @@ def bimodularity_partition_via_edge_kmeans(
         send_label=send_label,
         recv_label=recv_label,
         edge_cluster=labels,
+        edges=edges,
+        edge_weight=edge_w_arr,
         n_clusters=n_clusters,
         q_bimod=q_bimod,
     )
@@ -400,6 +716,13 @@ def main() -> None:
     parser.add_argument("--graph-pkl", type=str, default="data/preprocessed/subgraph.pkl")
     parser.add_argument("--nodes-min", type=int, default=100)
     parser.add_argument("--nodes-max", type=int, default=200)
+    parser.add_argument(
+        "--slice-strategy",
+        type=str,
+        default="cycle",
+        choices=["single", "cycle"],
+        help="Slice selection: 'single' picks one Louvain module; 'cycle' picks multiple modules forming a directed cycle.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--gamma", type=float, default=1.0)
     parser.add_argument("--svd-rank", type=int, default=6)
@@ -416,9 +739,22 @@ def main() -> None:
         raise FileNotFoundError(graph_path)
 
     graph_full = load_flywire_subgraph_pickle(graph_path)
-    slice_info = pick_slice_via_louvain(
-        graph_full, target_min=args.nodes_min, target_max=args.nodes_max, seed=args.seed, weight="weight"
-    )
+    if args.slice_strategy == "single":
+        slice_info = pick_slice_via_louvain(
+            graph_full, target_min=args.nodes_min, target_max=args.nodes_max, seed=args.seed, weight="weight"
+        )
+    else:
+        slice_info = pick_slice_via_directed_cycle_search(
+            graph_full,
+            target_min=args.nodes_min,
+            target_max=args.nodes_max,
+            seed=args.seed,
+            weight="weight",
+            gamma=args.gamma,
+            svd_rank=args.svd_rank,
+            min_edge_weight=min(1.0, args.min_edge_weight),
+            max_edges=max(12000, int(args.max_edges)),
+        )
 
     graph_slice = graph_full.subgraph(slice_info.nodes).copy()
     nodes = list(graph_slice.nodes())
@@ -431,11 +767,28 @@ def main() -> None:
     mod_q_dir = directed_modularity_score(a, mod_labels, gamma=args.gamma)
     mod_within_frac = float(a[mod_labels[:, None] == mod_labels[None, :]].sum() / max(1.0, a.sum()))
 
+    picked_k = None
+    if slice_info.meta and isinstance(slice_info.meta, dict) and "picked_k" in slice_info.meta:
+        try:
+            picked_k = int(slice_info.meta["picked_k"])
+        except Exception:
+            picked_k = None
+
     if args.clusters and args.clusters >= 2:
         bimod_best = bimodularity_partition_via_edge_kmeans(
             a,
             svd_rank=args.svd_rank,
             n_clusters=args.clusters,
+            min_edge_weight=args.min_edge_weight,
+            max_edges=args.max_edges,
+            seed=args.seed,
+            gamma=args.gamma,
+        )
+    elif picked_k is not None and picked_k >= 2:
+        bimod_best = bimodularity_partition_via_edge_kmeans(
+            a,
+            svd_rank=args.svd_rank,
+            n_clusters=picked_k,
             min_edge_weight=args.min_edge_weight,
             max_edges=args.max_edges,
             seed=args.seed,
@@ -469,6 +822,8 @@ def main() -> None:
 
     out_dir = root / "output" / "bimodularity"
     out_dir.mkdir(parents=True, exist_ok=True)
+    tag = "cycle" if args.slice_strategy != "single" else "single"
+    run_tag = f"{tag}_seed{args.seed}_n{len(nodes)}"
 
     title = f"slice n={len(nodes)} ({slice_info.reason})"
     print("Selected slice:", title)
@@ -510,7 +865,7 @@ def main() -> None:
     axes[1].set_xlabel("receivers (by community)")
     axes[1].set_ylabel("senders (by community)")
 
-    fig_adj_path = out_dir / "adjacency_reordered.png"
+    fig_adj_path = out_dir / f"adjacency_reordered_{run_tag}.png"
     fig.savefig(fig_adj_path, dpi=200)
     plt.close(fig)
 
@@ -529,7 +884,7 @@ def main() -> None:
     axes[1].set_xlabel("to (recv cluster)")
     axes[1].set_ylabel("from (send cluster)")
 
-    fig_block_path = out_dir / "block_matrices.png"
+    fig_block_path = out_dir / f"block_matrices_{run_tag}.png"
     fig.savefig(fig_block_path, dpi=200)
     plt.close(fig)
 
@@ -547,13 +902,26 @@ def main() -> None:
         summary["name"] = node_meta["name"].astype(str).values
     if node_meta is not None and "community_label" in node_meta.columns:
         summary["community_label"] = node_meta["community_label"].astype(str).values
-    summary_path = out_dir / "slice_node_assignments.csv"
+    summary_path = out_dir / f"slice_node_assignments_{run_tag}.csv"
     summary.to_csv(summary_path, index=False)
 
     # Per-bicommunity contribution
     b = directed_modularity_matrix_outin(a, gamma=args.gamma)
     per_cluster_rows = []
     m_total = float(a.sum())
+    # Edge-cluster mass and participation (more "paper-like" bicommunity summary).
+    total_edge_w = float(bimod_best.edge_weight.sum())
+    edge_w_by_c = np.bincount(bimod_best.edge_cluster, weights=bimod_best.edge_weight, minlength=bimod_best.n_clusters)
+    edge_m_by_c = np.bincount(bimod_best.edge_cluster, minlength=bimod_best.n_clusters)
+    edge_w_frac = edge_w_by_c / total_edge_w if total_edge_w > 0 else np.zeros_like(edge_w_by_c)
+
+    senders_by_c: list[set[int]] = [set() for _ in range(bimod_best.n_clusters)]
+    receivers_by_c: list[set[int]] = [set() for _ in range(bimod_best.n_clusters)]
+    for (i, j), cc in zip(bimod_best.edges, bimod_best.edge_cluster, strict=True):
+        c_id = int(cc)
+        senders_by_c[c_id].add(int(i))
+        receivers_by_c[c_id].add(int(j))
+
     for c in range(bimod_best.n_clusters):
         send_mask = bimod_best.send_label == c
         recv_mask = bimod_best.recv_label == c
@@ -564,17 +932,57 @@ def main() -> None:
                 "n_senders": int(send_mask.sum()),
                 "n_receivers": int(recv_mask.sum()),
                 "q_contrib": contrib,
+                "edge_weight": float(edge_w_by_c[c]) if c < len(edge_w_by_c) else 0.0,
+                "edge_weight_frac": float(edge_w_frac[c]) if c < len(edge_w_frac) else 0.0,
+                "n_edges": int(edge_m_by_c[c]) if c < len(edge_m_by_c) else 0,
+                "unique_senders": int(len(senders_by_c[c])),
+                "unique_receivers": int(len(receivers_by_c[c])),
             }
         )
     per_cluster_df = pd.DataFrame(per_cluster_rows).sort_values("q_contrib", ascending=False)
-    per_cluster_path = out_dir / "bimodularity_cluster_contributions.csv"
+    per_cluster_path = out_dir / f"bimodularity_cluster_contributions_{run_tag}.csv"
     per_cluster_df.to_csv(per_cluster_path, index=False)
+
+    # Plot top bicommunities as sender->receiver submatrices (edge clusters).
+    # Build a sparse-ish cluster adjacency from clustered edges.
+    n_nodes = a.shape[0]
+    a_by_c = [np.zeros((n_nodes, n_nodes), dtype=float) for _ in range(bimod_best.n_clusters)]
+    for (i, j), cc, w in zip(bimod_best.edges, bimod_best.edge_cluster, bimod_best.edge_weight, strict=True):
+        a_by_c[int(cc)][int(i), int(j)] += float(w)
+
+    top_c = per_cluster_df.sort_values("edge_weight_frac", ascending=False)["cluster"].head(4).tolist()
+    if top_c:
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10), constrained_layout=True)
+        axes = axes.ravel()
+        for ax, c_id in zip(axes, top_c, strict=False):
+            senders = sorted(senders_by_c[int(c_id)])
+            receivers = sorted(receivers_by_c[int(c_id)])
+            if not senders or not receivers:
+                ax.axis("off")
+                continue
+            sub = a_by_c[int(c_id)][np.ix_(senders, receivers)]
+            vmax_sub = np.percentile(sub[sub > 0], 99) if np.any(sub > 0) else 1.0
+            sns.heatmap(np.log1p(sub), ax=ax, cmap="mako", cbar=False, vmin=0, vmax=math.log1p(vmax_sub))
+            ax.set_title(
+                f"Edge bicommunity {c_id}\n"
+                f"w={edge_w_by_c[int(c_id)]:.0f} ({edge_w_frac[int(c_id)]:.1%}), "
+                f"|S|={len(senders)}, |R|={len(receivers)}"
+            )
+            ax.set_xlabel("receivers")
+            ax.set_ylabel("senders")
+        for ax in axes[len(top_c) :]:
+            ax.axis("off")
+        fig_path = out_dir / f"bicommunity_submatrices_{run_tag}.png"
+        fig.savefig(fig_path, dpi=200)
+        plt.close(fig)
 
     print(f"Role mismatch (send!=recv): {role_mismatch:.3f}")
     print("Wrote:", str(fig_adj_path))
     print("Wrote:", str(fig_block_path))
     print("Wrote:", str(summary_path))
     print("Wrote:", str(per_cluster_path))
+    if top_c:
+        print("Wrote:", str(out_dir / f"bicommunity_submatrices_{run_tag}.png"))
 
 
 if __name__ == "__main__":
