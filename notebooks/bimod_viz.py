@@ -150,12 +150,105 @@ def plot_block_flow_panels(
         vmin=-vmax,
         vmax=vmax,
     )
-    axes[2].set_title("Enrichment vs out–in null")
+    axes[2].set_title("Enrichment vs out-in null")
     axes[2].set_xlabel("Receiver label")
     axes[2].set_ylabel("Sender label")
 
     if title:
         fig.suptitle(title)
+    fig.tight_layout()
+    return fig
+
+
+def plot_block_flow_single(
+    block: BlockFlow,
+    *,
+    kind: str,
+    labels_map: Optional[Dict[int, str]] = None,
+    eps: float = 1.0,
+    figsize: Tuple[int, int] = (7, 6),
+    title: Optional[str] = None,
+):
+    import seaborn as sns
+
+    kind = kind.lower().strip()
+    send_ticks = [labels_map.get(int(x), str(int(x))) for x in block.send_levels] if labels_map else block.send_levels
+    recv_ticks = [labels_map.get(int(x), str(int(x))) for x in block.recv_levels] if labels_map else block.recv_levels
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    if kind in {"log", "log1p"}:
+        data = np.log1p(block.flow)
+        cmap = "magma"
+        cbar_label = "log(1 + weight)"
+        panel_title = "Block flow (log scale)"
+    elif kind in {"row", "row_norm", "rownorm"}:
+        data = np.divide(
+            block.flow,
+            block.kout_by_send[:, None],
+            out=np.zeros_like(block.flow),
+            where=block.kout_by_send[:, None] > 0,
+        )
+        vmax = float(np.nanpercentile(data, 99.5)) if data.size else 1.0
+        vmax = max(vmax, 1e-12)
+        cmap = "viridis"
+        cbar_label = "Fraction of outgoing weight"
+        panel_title = "Row-normalized flow"
+        sns.heatmap(
+            data,
+            cmap=cmap,
+            ax=ax,
+            xticklabels=recv_ticks,
+            yticklabels=send_ticks,
+            cbar_kws={"label": cbar_label},
+            vmin=0,
+            vmax=vmax,
+        )
+        ax.set_title(title or panel_title)
+        ax.set_xlabel("Receiver label")
+        ax.set_ylabel("Sender label")
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        return fig
+    elif kind in {"enrich", "enrichment", "null"}:
+        data = np.log10((block.flow + eps) / (block.expected + eps))
+        vmax = float(np.nanpercentile(np.abs(data), 99.0)) if data.size else 1.0
+        vmax = max(vmax, 1e-12)
+        cmap = "coolwarm"
+        cbar_label = "log10((obs+eps)/(exp+eps))"
+        panel_title = "Enrichment vs out-in null"
+        sns.heatmap(
+            data,
+            cmap=cmap,
+            center=0,
+            ax=ax,
+            xticklabels=recv_ticks,
+            yticklabels=send_ticks,
+            cbar_kws={"label": cbar_label},
+            vmin=-vmax,
+            vmax=vmax,
+        )
+        ax.set_title(title or panel_title)
+        ax.set_xlabel("Receiver label")
+        ax.set_ylabel("Sender label")
+        ax.tick_params(axis="x", rotation=45)
+        fig.tight_layout()
+        return fig
+    else:
+        raise ValueError("kind must be one of: 'log', 'row', 'enrich'")
+
+    sns.heatmap(
+        data,
+        cmap=cmap,
+        ax=ax,
+        xticklabels=recv_ticks,
+        yticklabels=send_ticks,
+        cbar_kws={"label": cbar_label},
+    )
+    ax.set_title(title or panel_title)
+    ax.set_xlabel("Receiver label")
+    ax.set_ylabel("Sender label")
+    ax.tick_params(axis="x", rotation=45)
     fig.tight_layout()
     return fig
 
@@ -190,6 +283,7 @@ def plot_edge_cluster_grid(
     df: pd.DataFrame,
     U: np.ndarray,
     V: np.ndarray,
+    background_df: Optional[pd.DataFrame] = None,
     cluster_col: str = "edge_cluster",
     pre_col: str = "pre_idx",
     post_col: str = "post_idx",
@@ -233,12 +327,24 @@ def plot_edge_cluster_grid(
     fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows), squeeze=False)
 
     rng = np.random.default_rng(random_state)
-    bg_n = min(int(background_edges), pre.size)
+    if background_df is None:
+        bg_pre = pre
+        bg_post = post
+    else:
+        bg_pre = background_df[pre_col].to_numpy(dtype=int, copy=False)
+        bg_post = background_df[post_col].to_numpy(dtype=int, copy=False)
+
+    bg_n = min(int(background_edges), bg_pre.size)
     if bg_n > 0:
-        bg_sel = rng.choice(pre.size, size=bg_n, replace=False)
-        bg_segments = np.stack([pos[pre[bg_sel]], pos[post[bg_sel]]], axis=1)
+        bg_sel = rng.choice(bg_pre.size, size=bg_n, replace=False)
+        bg_segments = np.stack([pos[bg_pre[bg_sel]], pos[bg_post[bg_sel]]], axis=1)
     else:
         bg_segments = None
+
+    x_min, x_max = float(pos[:, 0].min()), float(pos[:, 0].max())
+    y_min, y_max = float(pos[:, 1].min()), float(pos[:, 1].max())
+    x_pad = 0.05 * (x_max - x_min + 1e-12)
+    y_pad = 0.05 * (y_max - y_min + 1e-12)
 
     send_color = "#d62728"  # red
     recv_color = "#1f77b4"  # blue
@@ -247,6 +353,8 @@ def plot_edge_cluster_grid(
     for panel_idx, cluster_id in enumerate(cluster_order):
         ax = axes[panel_idx // ncols][panel_idx % ncols]
         ax.set_axis_off()
+        ax.set_xlim(x_min - x_pad, x_max + x_pad)
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
 
         if bg_segments is not None:
             ax.add_collection(LineCollection(bg_segments, colors="k", linewidths=0.2, alpha=0.03))
