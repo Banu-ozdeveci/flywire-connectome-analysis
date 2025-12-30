@@ -25,6 +25,55 @@ def _as_array(x) -> np.ndarray:
     return np.asarray(x)
 
 
+def _set_heatmap_ticks(ax, xlabels, ylabels, *, x_offset: float = 0.0, y_offset: float = 0.0):
+    xlabels = [str(x) for x in xlabels]
+    ylabels = [str(y) for y in ylabels]
+
+    n_x = len(xlabels)
+    n_y = len(ylabels)
+
+    # Prefer extracting cell centers from the rendered QuadMesh (seaborn heatmap),
+    # which is robust across seaborn/matplotlib versions and avoids off-by-0.5 ticks.
+    x_centers = None
+    y_centers = None
+    if ax.collections and hasattr(ax.collections[0], "get_coordinates"):
+        coords = ax.collections[0].get_coordinates()
+        if coords is not None and coords.ndim == 3 and coords.shape[-1] == 2:
+            x_edges = coords[0, :, 0].astype(float, copy=False)
+            y_edges = coords[:, 0, 1].astype(float, copy=False)
+            if len(x_edges) == n_x + 1 and len(y_edges) == n_y + 1:
+                x_centers = (x_edges[:-1] + x_edges[1:]) / 2.0
+                y_centers = (y_edges[:-1] + y_edges[1:]) / 2.0
+
+    # Fallback: infer centers from axis limits.
+    if x_centers is None or y_centers is None:
+        x0, x1 = ax.get_xlim()
+        y0, y1 = ax.get_ylim()
+
+        x_left = min(x0, x1)
+        y_bottom = min(y0, y1)
+
+        if n_x:
+            x_centers = np.linspace(x_left + 0.5, max(x0, x1) - 0.5, n_x)
+        else:
+            x_centers = []
+
+        if n_y:
+            y_centers = np.linspace(y_bottom + 0.5, max(y0, y1) - 0.5, n_y)
+        else:
+            y_centers = []
+
+    if len(x_centers):
+        x_centers = np.asarray(x_centers, dtype=float) + float(x_offset)
+    if len(y_centers):
+        y_centers = np.asarray(y_centers, dtype=float) + float(y_offset)
+
+    ax.set_xticks(x_centers)
+    ax.set_yticks(y_centers)
+    ax.set_xticklabels(xlabels, rotation=45, ha="right")
+    ax.set_yticklabels(ylabels, rotation=0)
+
+
 def block_flow_from_edges(
     df: pd.DataFrame,
     send_labels: Sequence[int],
@@ -94,6 +143,8 @@ def plot_block_flow_panels(
     title: Optional[str] = None,
     eps: float = 1.0,
     figsize: Tuple[int, int] = (18, 5),
+    tick_offset_x: float = 0.0,
+    tick_offset_y: float = 0.0,
 ):
     import seaborn as sns
 
@@ -106,10 +157,11 @@ def plot_block_flow_panels(
         np.log1p(block.flow),
         cmap="magma",
         ax=axes[0],
-        xticklabels=recv_ticks,
-        yticklabels=send_ticks,
+        xticklabels=False,
+        yticklabels=False,
         cbar_kws={"label": "log(1 + weight)"},
     )
+    _set_heatmap_ticks(axes[0], recv_ticks, send_ticks, x_offset=tick_offset_x, y_offset=tick_offset_y)
     axes[0].set_title("Block flow (log scale)")
     axes[0].set_xlabel("Receiver label")
     axes[0].set_ylabel("Sender label")
@@ -126,12 +178,13 @@ def plot_block_flow_panels(
         row_frac,
         cmap="viridis",
         ax=axes[1],
-        xticklabels=recv_ticks,
-        yticklabels=send_ticks,
+        xticklabels=False,
+        yticklabels=False,
         cbar_kws={"label": "Fraction of outgoing weight"},
         vmin=0,
         vmax=vmax,
     )
+    _set_heatmap_ticks(axes[1], recv_ticks, send_ticks, x_offset=tick_offset_x, y_offset=tick_offset_y)
     axes[1].set_title("Row-normalized flow")
     axes[1].set_xlabel("Receiver label")
     axes[1].set_ylabel("Sender label")
@@ -144,12 +197,13 @@ def plot_block_flow_panels(
         cmap="coolwarm",
         center=0,
         ax=axes[2],
-        xticklabels=recv_ticks,
-        yticklabels=send_ticks,
+        xticklabels=False,
+        yticklabels=False,
         cbar_kws={"label": "log10((obs+eps)/(exp+eps))"},
         vmin=-vmax,
         vmax=vmax,
     )
+    _set_heatmap_ticks(axes[2], recv_ticks, send_ticks, x_offset=tick_offset_x, y_offset=tick_offset_y)
     axes[2].set_title("Enrichment vs out-in null")
     axes[2].set_xlabel("Receiver label")
     axes[2].set_ylabel("Sender label")
@@ -168,6 +222,8 @@ def plot_block_flow_single(
     eps: float = 1.0,
     figsize: Tuple[int, int] = (7, 6),
     title: Optional[str] = None,
+    tick_offset_x: float = 0.0,
+    tick_offset_y: float = 0.0,
 ):
     import seaborn as sns
 
@@ -177,6 +233,7 @@ def plot_block_flow_single(
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
+    heatmap_kwargs = {}
     if kind in {"log", "log1p"}:
         data = np.log1p(block.flow)
         cmap = "magma"
@@ -194,22 +251,7 @@ def plot_block_flow_single(
         cmap = "viridis"
         cbar_label = "Fraction of outgoing weight"
         panel_title = "Row-normalized flow"
-        sns.heatmap(
-            data,
-            cmap=cmap,
-            ax=ax,
-            xticklabels=recv_ticks,
-            yticklabels=send_ticks,
-            cbar_kws={"label": cbar_label},
-            vmin=0,
-            vmax=vmax,
-        )
-        ax.set_title(title or panel_title)
-        ax.set_xlabel("Receiver label")
-        ax.set_ylabel("Sender label")
-        ax.tick_params(axis="x", rotation=45)
-        fig.tight_layout()
-        return fig
+        heatmap_kwargs.update(vmin=0, vmax=vmax)
     elif kind in {"enrich", "enrichment", "null"}:
         data = np.log10((block.flow + eps) / (block.expected + eps))
         vmax = float(np.nanpercentile(np.abs(data), 99.0)) if data.size else 1.0
@@ -217,23 +259,7 @@ def plot_block_flow_single(
         cmap = "coolwarm"
         cbar_label = "log10((obs+eps)/(exp+eps))"
         panel_title = "Enrichment vs out-in null"
-        sns.heatmap(
-            data,
-            cmap=cmap,
-            center=0,
-            ax=ax,
-            xticklabels=recv_ticks,
-            yticklabels=send_ticks,
-            cbar_kws={"label": cbar_label},
-            vmin=-vmax,
-            vmax=vmax,
-        )
-        ax.set_title(title or panel_title)
-        ax.set_xlabel("Receiver label")
-        ax.set_ylabel("Sender label")
-        ax.tick_params(axis="x", rotation=45)
-        fig.tight_layout()
-        return fig
+        heatmap_kwargs.update(center=0, vmin=-vmax, vmax=vmax)
     else:
         raise ValueError("kind must be one of: 'log', 'row', 'enrich'")
 
@@ -241,14 +267,15 @@ def plot_block_flow_single(
         data,
         cmap=cmap,
         ax=ax,
-        xticklabels=recv_ticks,
-        yticklabels=send_ticks,
+        xticklabels=False,
+        yticklabels=False,
         cbar_kws={"label": cbar_label},
+        **heatmap_kwargs,
     )
+    _set_heatmap_ticks(ax, recv_ticks, send_ticks, x_offset=tick_offset_x, y_offset=tick_offset_y)
     ax.set_title(title or panel_title)
     ax.set_xlabel("Receiver label")
     ax.set_ylabel("Sender label")
-    ax.tick_params(axis="x", rotation=45)
     fig.tight_layout()
     return fig
 
