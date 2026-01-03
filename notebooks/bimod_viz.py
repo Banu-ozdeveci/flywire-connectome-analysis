@@ -140,6 +140,8 @@ def plot_block_flow_panels(
     block: BlockFlow,
     *,
     labels_map: Optional[Dict[int, str]] = None,
+    send_labels_map: Optional[Dict[int, str]] = None,
+    recv_labels_map: Optional[Dict[int, str]] = None,
     title: Optional[str] = None,
     eps: float = 1.0,
     figsize: Tuple[int, int] = (18, 5),
@@ -148,8 +150,17 @@ def plot_block_flow_panels(
 ):
     import seaborn as sns
 
-    send_ticks = [labels_map.get(int(x), str(int(x))) for x in block.send_levels] if labels_map else block.send_levels
-    recv_ticks = [labels_map.get(int(x), str(int(x))) for x in block.recv_levels] if labels_map else block.recv_levels
+    if send_labels_map is None:
+        send_labels_map = labels_map
+    if recv_labels_map is None:
+        recv_labels_map = labels_map
+
+    send_ticks = (
+        [send_labels_map.get(int(x), str(int(x))) for x in block.send_levels] if send_labels_map else block.send_levels
+    )
+    recv_ticks = (
+        [recv_labels_map.get(int(x), str(int(x))) for x in block.recv_levels] if recv_labels_map else block.recv_levels
+    )
 
     fig, axes = plt.subplots(1, 3, figsize=figsize)
 
@@ -219,6 +230,8 @@ def plot_block_flow_single(
     *,
     kind: str,
     labels_map: Optional[Dict[int, str]] = None,
+    send_labels_map: Optional[Dict[int, str]] = None,
+    recv_labels_map: Optional[Dict[int, str]] = None,
     eps: float = 1.0,
     figsize: Tuple[int, int] = (7, 6),
     title: Optional[str] = None,
@@ -228,8 +241,17 @@ def plot_block_flow_single(
     import seaborn as sns
 
     kind = kind.lower().strip()
-    send_ticks = [labels_map.get(int(x), str(int(x))) for x in block.send_levels] if labels_map else block.send_levels
-    recv_ticks = [labels_map.get(int(x), str(int(x))) for x in block.recv_levels] if labels_map else block.recv_levels
+    if send_labels_map is None:
+        send_labels_map = labels_map
+    if recv_labels_map is None:
+        recv_labels_map = labels_map
+
+    send_ticks = (
+        [send_labels_map.get(int(x), str(int(x))) for x in block.send_levels] if send_labels_map else block.send_levels
+    )
+    recv_ticks = (
+        [recv_labels_map.get(int(x), str(int(x))) for x in block.recv_levels] if recv_labels_map else block.recv_levels
+    )
 
     fig, ax = plt.subplots(1, 1, figsize=figsize)
 
@@ -311,6 +333,7 @@ def plot_edge_cluster_grid(
     U: np.ndarray,
     V: np.ndarray,
     background_df: Optional[pd.DataFrame] = None,
+    cluster_name_map: Optional[Dict[int, str]] = None,
     cluster_col: str = "edge_cluster",
     pre_col: str = "pre_idx",
     post_col: str = "post_idx",
@@ -378,6 +401,13 @@ def plot_edge_cluster_grid(
     both_color = "#9467bd"  # purple
 
     for panel_idx, cluster_id in enumerate(cluster_order):
+        cluster_id = int(cluster_id)
+        cluster_label = (
+            str(cluster_name_map.get(cluster_id))
+            if cluster_name_map and cluster_name_map.get(cluster_id) is not None
+            else f"Cluster {cluster_id}"
+        )
+
         ax = axes[panel_idx // ncols][panel_idx % ncols]
         ax.set_axis_off()
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
@@ -388,7 +418,7 @@ def plot_edge_cluster_grid(
 
         mask = clusters == cluster_id
         if not np.any(mask):
-            ax.set_title(f"Cluster {cluster_id}")
+            ax.set_title(cluster_label)
             continue
 
         cu = pre[mask]
@@ -423,7 +453,7 @@ def plot_edge_cluster_grid(
         segments = np.stack([pos[draw_u], pos[draw_v]], axis=1)
         ax.add_collection(LineCollection(segments, colors="k", linewidths=0.35, alpha=edge_alpha))
 
-        ax.set_title(f"Cluster {cluster_id} | edges={int(mask.sum()):,} | weight={cluster_weight[cluster_id]:.0f}")
+        ax.set_title(f"{cluster_label} | edges={int(mask.sum()):,} | weight={cluster_weight[cluster_id]:.0f}")
 
     for panel_idx in range(n_panels, nrows * ncols):
         axes[panel_idx // ncols][panel_idx % ncols].set_axis_off()
